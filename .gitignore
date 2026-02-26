@@ -8,3 +8,4 @@ server.log
 google_creds_base64.txt
 *.egg-info/
 .DS_Store
+AI-Image-analysis/*.json
