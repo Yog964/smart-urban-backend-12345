@@ -1,0 +1,10 @@
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.env
+uploads/
+server.log
+google_creds_base64.txt
+*.egg-info/
+.DS_Store
