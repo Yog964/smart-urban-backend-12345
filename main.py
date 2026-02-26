@@ -28,7 +28,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
+app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
@@ -117,7 +117,7 @@ async def upload_file(file: UploadFile = File(...)):
     with open(file_location, "wb+") as file_object:
         file_object.write(file.file.read())
     # Return as path so frontend logic doesn't break
-    return {"image_url": file_location}
+    return {"image_url": f"uploads/{unique_filename}"}
 
 
 @app.post("/complaints/", response_model=schemas.ComplaintAIResponse)
