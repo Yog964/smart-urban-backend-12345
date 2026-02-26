@@ -1,20 +1,41 @@
 from fastapi import FastAPI, Depends, HTTPException, status, File, UploadFile
-from fastapi.staticfiles import StaticFiles
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
 from database import engine, Base, SessionLocal
+from fastapi.middleware.cors import CORSMiddleware
+from dotenv import load_dotenv
 import models, schemas, utils
+import os
+import uuid
+import sys
+
+load_dotenv()
+
+# Add AI-Image-analysis to path so we can import the analyzer
+_AI_DIR = os.path.join(os.path.dirname(__file__), "AI-Image-analysis")
+if _AI_DIR not in sys.path:
+    sys.path.insert(0, _AI_DIR)
+
+try:
+    from urban_vision_analyzer import UrbanIssueAnalyzer
+    _analyzer = UrbanIssueAnalyzer()
+    print("[AI] UrbanIssueAnalyzer loaded ✅")
+except Exception as e:
+    _analyzer = None
+    print(f"[AI] ⚠️ Could not load UrbanIssueAnalyzer: {e}")
+
+
+# Supabase config from env
+SUPABASE_URL = os.getenv("SUPABASE_URL", "")
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
+SUPABASE_BUCKET = os.getenv("SUPABASE_BUCKET", "complaint-images")
 
 def get_db():
-    print("Opening DB session...")
     db = SessionLocal()
     try:
         yield db
     finally:
-        print("Closing DB session.")
         db.close()
-from fastapi.middleware.cors import CORSMiddleware
-import os
 
 Base.metadata.create_all(bind=engine)
 
@@ -28,7 +49,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
+
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
@@ -104,58 +125,173 @@ def read_users_me(current_user: models.User = Depends(get_current_user)):
     return current_user
 
 
-# Fake directory for uploads for now. Vercel is read-only except /tmp
-UPLOAD_DIR = "/tmp/uploads" if os.environ.get("VERCEL") else "uploads"
-os.makedirs(UPLOAD_DIR, exist_ok=True)
+# --- Supabase Storage Upload (Backend / service key only) ---
+ALLOWED_MIME_TYPES = {
+    "image/jpeg", "image/png", "image/webp", "image/gif",
+    "audio/mpeg", "audio/mp4", "audio/wav", "audio/ogg", "audio/m4a", "audio/x-m4a",
+}
+MAX_FILE_SIZE_BYTES = 5 * 1024 * 1024  # 5MB
 
 @app.post("/upload/", response_model=dict)
 async def upload_file(file: UploadFile = File(...)):
-    import uuid
-    file_extension = os.path.splitext(file.filename)[1]
-    unique_filename = f"{uuid.uuid4()}{file_extension}"
-    file_location = f"{UPLOAD_DIR}/{unique_filename}"
-    with open(file_location, "wb+") as file_object:
-        file_object.write(file.file.read())
-    # Return as path so frontend logic doesn't break
-    return {"image_url": f"uploads/{unique_filename}"}
+    print(f"[UPLOAD] Received file: {file.filename}, type: {file.content_type}")
+
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+        raise HTTPException(status_code=500, detail="Supabase storage not configured on server.")
+
+    # Validate MIME type
+    content_type = file.content_type or "application/octet-stream"
+    if content_type not in ALLOWED_MIME_TYPES:
+        raise HTTPException(status_code=400, detail=f"Unsupported file type: {content_type}. Allowed: {ALLOWED_MIME_TYPES}")
+
+    file_bytes = await file.read()
+
+    # Validate file size
+    if len(file_bytes) > MAX_FILE_SIZE_BYTES:
+        raise HTTPException(status_code=400, detail=f"File too large. Max allowed: 5MB, received: {len(file_bytes) // 1024}KB")
+
+    # Build unique path: public/<timestamp>_<uuid><ext>
+    import time
+    file_extension = os.path.splitext(file.filename or "file")[1] or ".jpg"
+    timestamp = int(time.time() * 1000)
+    unique_filename = f"public/{timestamp}_{uuid.uuid4().hex}{file_extension}"
+
+    print(f"[UPLOAD] Uploading to Supabase bucket '{SUPABASE_BUCKET}', path: {unique_filename}")
+
+    import httpx
+    upload_url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{unique_filename}"
+    headers = {
+        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+        "Content-Type": content_type,
+        "x-upsert": "true",
+    }
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        res = await client.post(upload_url, content=file_bytes, headers=headers)
+        print(f"[UPLOAD] Supabase response: {res.status_code} — {res.text[:200]}")
+        if res.status_code not in (200, 201):
+            raise HTTPException(status_code=500, detail=f"Supabase upload failed ({res.status_code}): {res.text}")
+
+    # Build permanent public URL
+    public_url = f"{SUPABASE_URL}/storage/v1/object/public/{SUPABASE_BUCKET}/{unique_filename}"
+    print(f"[UPLOAD] ✅ Success! Public URL: {public_url}")
+    return {"image_url": public_url}
+
+
+# --- AI Analysis endpoint (called by Flutter after image upload) ---
+@app.post("/analyze/", response_model=dict)
+async def analyze_image_url(payload: dict):
+    """
+    Accepts { "image_url": "<public supabase url>" }
+    Returns { "department", "subcategory", "issue_type", "confidence_percent", "severity_score", "ai_detected" }
+    """
+    image_url = payload.get("image_url", "")
+    print(f"[ANALYZE] Received URL: {image_url}")
+
+    if not image_url or not image_url.startswith("http"):
+        return {"ai_detected": False, "department": None, "subcategory": None, "issue_type": "unknown", "confidence_percent": 0, "severity_score": 1}
+
+    if not _analyzer:
+        print("[ANALYZE] Analyzer not available")
+        return {"ai_detected": False, "department": None, "subcategory": None, "issue_type": "unknown", "confidence_percent": 0, "severity_score": 1}
+
+    result = _analyzer.analyze_image_from_url(image_url)
+    print(f"[ANALYZE] Result: {result}")
+    return result
 
 
 @app.post("/complaints/", response_model=schemas.ComplaintAIResponse)
-def create_complaint(complaint: schemas.ComplaintCreate, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
-    # MOCK AI Service Call
-    ai_issue_type = "Pothole"
-    ai_severity = 7.5
-    ai_confidence = 88.0
-    ai_dept = "Roads & Bridges"
-    
-    new_complaint = models.Complaint(
-        title=complaint.title,
-        description=complaint.description,
-        image_url=complaint.image_url,
-        voice_url=complaint.voice_url,
-        latitude=complaint.latitude,
-        longitude=complaint.longitude,
-        reporter_id=current_user.id,
-        department=complaint.department,
-        issue_type=complaint.subcategory, # Maps to subcategory select
-        severity_score=ai_severity,
-        confidence_score=ai_confidence,
-        department_suggested=ai_dept # Predicted
-    )
-    
-    db.add(new_complaint)
-    db.commit()
-    db.refresh(new_complaint)
-    
-    return new_complaint
+def create_complaint(
+    complaint: schemas.ComplaintCreate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+    print(f"[COMPLAINT] Creating for user: {current_user.phone_number}")
+    print(f"[COMPLAINT] image_url: {complaint.image_url}")
+    print(f"[COMPLAINT] voice_url: {complaint.voice_url}")
+    print(f"[COMPLAINT] user-provided dept: {complaint.department}, sub: {complaint.subcategory}")
+
+    # ── AI ANALYSIS ──────────────────────────────────────────────────────────
+    ai_department   = None
+    ai_subcategory  = None
+    ai_severity     = 5.0
+    ai_confidence   = 0.0
+    ai_issue_type   = "unknown"
+
+    if complaint.image_url and complaint.image_url.startswith("http") and _analyzer:
+        print(f"[AI] Running analysis on: {complaint.image_url}")
+        try:
+            result = _analyzer.analyze_image_from_url(complaint.image_url)
+            print(f"[AI] Result → {result}")
+
+            if result.get("ai_detected"):
+                ai_issue_type  = result["issue_type"]
+                ai_department  = result["department"]
+                ai_subcategory = result["subcategory"]
+                ai_severity    = float(result.get("severity_score", 5))
+                ai_confidence  = float(result.get("confidence_percent", 0))
+                print(f"[AI] ✅ Auto-detected: dept={ai_department}, sub={ai_subcategory}, severity={ai_severity}")
+            else:
+                print(f"[AI] ⚠️ Low confidence or unknown. Falling back to user selection.")
+        except Exception as e:
+            print(f"[AI] ❌ Analysis failed: {e}")
+    else:
+        print(f"[AI] Skipped (no image URL or analyzer unavailable)")
+
+    # Fallback: use user-provided values if AI couldn't determine
+    final_department  = ai_department  or complaint.department  or "General"
+    final_subcategory = ai_subcategory or complaint.subcategory or "Other"
+    final_issue_type  = ai_issue_type  if ai_issue_type != "unknown" else (complaint.subcategory or "Other")
+
+    # Auto-generate title if not meaningful
+    final_title = complaint.title
+    if ai_department and f"{final_subcategory} at {final_department}" != complaint.title:
+        final_title = f"{final_subcategory} at {final_department}"
+
+    print(f"[COMPLAINT] Final → dept={final_department}, sub={final_subcategory}, severity={ai_severity}, confidence={ai_confidence}%")
+
+    try:
+        new_complaint = models.Complaint(
+            title=final_title,
+            description=complaint.description,
+            image_url=complaint.image_url,
+            voice_url=complaint.voice_url,
+            latitude=complaint.latitude,
+            longitude=complaint.longitude,
+            reporter_id=current_user.id,
+            department=final_department,
+            issue_type=final_subcategory,
+            severity_score=ai_severity,
+            confidence_score=ai_confidence,
+            department_suggested=ai_department or final_department,
+        )
+        db.add(new_complaint)
+        db.commit()
+        db.refresh(new_complaint)
+        print(f"[COMPLAINT] ✅ Saved. ID={new_complaint.id} | dept={new_complaint.department} | issue={new_complaint.issue_type} | severity={new_complaint.severity_score}")
+        return new_complaint
+    except Exception as e:
+        print(f"[COMPLAINT] ❌ DB Error: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.get("/complaints/", response_model=list[schemas.ComplaintAIResponse])
 def get_all_complaints(db: Session = Depends(get_db)):
-    return db.query(models.Complaint).all()
+    complaints = db.query(models.Complaint).all()
+    print(f"[FETCH] All complaints count: {len(complaints)}")
+    for c in complaints:
+        print(f"  - ID:{c.id} | image_url:{c.image_url} | voice_url:{c.voice_url}")
+    return complaints
 
 @app.get("/complaints/me", response_model=list[schemas.ComplaintAIResponse])
 def get_my_complaints(db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
-    return db.query(models.Complaint).filter(models.Complaint.reporter_id == current_user.id).all()
+    complaints = db.query(models.Complaint).filter(models.Complaint.reporter_id == current_user.id).all()
+    print(f"[FETCH] Complaints for user {current_user.phone_number}: {len(complaints)}")
+    for c in complaints:
+        print(f"  - ID:{c.id} | image_url:{c.image_url} | voice_url:{c.voice_url}")
+    return complaints
+
 
 @app.get("/workers/", response_model=list[schemas.Worker])
 def get_all_workers(db: Session = Depends(get_db)):

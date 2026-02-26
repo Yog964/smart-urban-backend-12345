@@ -35,8 +35,8 @@ class ComplaintBase(BaseModel):
     image_url: str 
     
 class ComplaintCreate(ComplaintBase):
-    department: str
-    subcategory: str # This maps to issue_type in DB
+    department: Optional[str] = None   # AI will auto-fill if not provided
+    subcategory: Optional[str] = None  # AI will auto-fill if not provided
     voice_url: Optional[str] = None
 
 class ComplaintAIResponse(ComplaintBase):
