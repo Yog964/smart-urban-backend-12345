@@ -1,38 +1,44 @@
 import os
 import json
+import base64
 import logging
 import tempfile
 import httpx
 from google.cloud import vision
 
+print("[AI] Starting credential setup...")
+
 # --------------------------------------------------
 # GOOGLE CREDENTIALS — supports local file AND Vercel env var
 # --------------------------------------------------
-# Option 1 (local dev): JSON file next to this script
-_CREDS_FILE = os.path.join(os.path.dirname(__file__), "instant-sound-456709-j3-9eba69829a2b.json")
-
-# Option 2 (Vercel/production): base64-encoded JSON in env var GOOGLE_CREDENTIALS_JSON
-_CREDS_JSON_ENV = os.environ.get("GOOGLE_CREDENTIALS_JSON", "")
+_CREDS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "instant-sound-456709-j3-9eba69829a2b.json")
+_CREDS_JSON_ENV = os.environ.get("GOOGLE_CREDENTIALS_JSON", "").strip()
 
 if _CREDS_JSON_ENV:
-    # Write credentials from env var to a temp file
-    import base64
+    print(f"[AI] GOOGLE_CREDENTIALS_JSON found (length={len(_CREDS_JSON_ENV)})")
     try:
+        # Fix base64 padding
+        missing_padding = len(_CREDS_JSON_ENV) % 4
+        if missing_padding:
+            _CREDS_JSON_ENV += '=' * (4 - missing_padding)
         _decoded = base64.b64decode(_CREDS_JSON_ENV).decode("utf-8")
+        _creds_data = json.loads(_decoded)  # Validate JSON
         _tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False)
-        _tmp.write(_decoded)
+        json.dump(_creds_data, _tmp)
         _tmp.close()
         os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = _tmp.name
-        logging.info(f"[AI] Loaded credentials from GOOGLE_CREDENTIALS_JSON env var ✅")
+        print(f"[AI] ✅ Credentials loaded from env var. project_id={_creds_data.get('project_id', 'unknown')}")
     except Exception as e:
-        logging.warning(f"[AI] Failed to load credentials from env var: {e}")
+        print(f"[AI] ❌ Failed to decode GOOGLE_CREDENTIALS_JSON: {e}")
 elif os.path.exists(_CREDS_FILE):
     os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = _CREDS_FILE
-    logging.info(f"[AI] Loaded credentials from file: {_CREDS_FILE} ✅")
+    print(f"[AI] ✅ Credentials loaded from local file.")
 else:
-    logging.warning(f"[AI] No Google credentials found. Vision API will be unavailable.")
+    print(f"[AI] ⚠️ No credentials found. GOOGLE_CREDENTIALS_JSON env var not set and local file missing.")
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+
+
 
 
 class UrbanIssueAnalyzer:
